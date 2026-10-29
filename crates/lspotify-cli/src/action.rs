@@ -27,6 +27,7 @@ pub enum Effect {
     Repeat(u8),
     PlayTrack { uri: String, device_id: Option<String> },
     PlayContext { uri: String, position: usize, device_id: Option<String> },
+    PlayTracks { uris: Vec<String>, device_id: Option<String> },
     Enqueue(String),
     Transfer(String),
     TransferLocal(String),
@@ -929,6 +930,20 @@ fn activate(state: &mut AppState) -> Vec<Effect> {
                     position: context.position,
                     device_id: state.target_device_id(),
                 }]
+            } else if state.focus == FocusRegion::Content
+                && matches!(state.page.route, Route::Artist { .. })
+            {
+                // Artist songs are search-derived, so an artist context would not preserve
+                // the displayed order or the selected song. Send the remaining songs explicitly.
+                let uris = state
+                    .page
+                    .flattened()
+                    .into_iter()
+                    .skip(state.page.cursor.selected)
+                    .filter(|track| track.kind == EntityKind::Track && track.available)
+                    .filter_map(|track| track.uri.clone())
+                    .collect();
+                vec![Effect::PlayTracks { uris, device_id: state.target_device_id() }]
             } else {
                 item.uri.map_or_else(Vec::new, |uri| {
                     vec![Effect::PlayTrack { uri, device_id: state.target_device_id() }]
@@ -1953,6 +1968,64 @@ mod tests {
         state.back();
         assert_eq!(state.page.route, snapshot.route);
         assert_eq!(state.page.cursor, snapshot.cursor);
+    }
+
+    #[test]
+    fn artist_activation_plays_remaining_available_songs_in_order() {
+        let mut unavailable = item(EntityKind::Track, "Unavailable", "spotify:track:no", None);
+        unavailable.available = false;
+        let mut state = AppState {
+            page: page_with(
+                Route::Artist { uri: "spotify:artist:a".into(), title: "Artist".into() },
+                vec![
+                    item(EntityKind::Track, "Earlier", "spotify:track:earlier", None),
+                    item(EntityKind::Track, "Selected", "spotify:track:same", None),
+                    unavailable,
+                    item(EntityKind::Track, "Duplicate", "spotify:track:same", None),
+                    item(EntityKind::Track, "Last", "spotify:track:last", None),
+                    item(EntityKind::Album, "Release", "spotify:album:a", None),
+                ],
+            ),
+            selected_device_id: Some("device".into()),
+            ..AppState::default()
+        };
+        state.page.cursor.selected = 1;
+        assert_eq!(
+            reduce(&mut state, Action::Activate),
+            vec![Effect::PlayTracks {
+                uris: vec![
+                    "spotify:track:same".into(),
+                    "spotify:track:same".into(),
+                    "spotify:track:last".into()
+                ],
+                device_id: Some("device".into()),
+            }]
+        );
+        assert_eq!(state.queue_now.as_ref().unwrap().title, "Selected");
+
+        // Starting a song in the queue must not substitute the artist page's songs.
+        state.focus = FocusRegion::Queue;
+        state.queue_upcoming =
+            vec![item(EntityKind::Track, "Queued", "spotify:track:queued", None)];
+        assert!(matches!(reduce(&mut state, Action::Activate).as_slice(),
+            [Effect::PlayTrack { uri, .. }] if uri == "spotify:track:queued"));
+    }
+
+    #[test]
+    fn liked_activation_keeps_original_position_beyond_first_page() {
+        let mut liked = item(EntityKind::Track, "Liked", "spotify:track:liked", None);
+        liked.context =
+            Some(ContextPosition { uri: "spotify:collection:tracks".into(), position: 75 });
+        let mut state =
+            AppState { page: page_with(Route::Library, vec![liked]), ..AppState::default() };
+        assert_eq!(
+            reduce(&mut state, Action::Activate),
+            vec![Effect::PlayContext {
+                uri: "spotify:collection:tracks".into(),
+                position: 75,
+                device_id: None,
+            }]
+        );
     }
 
     fn page_with(route: Route, items: Vec<BrowseItem>) -> PageState {

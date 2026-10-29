@@ -167,6 +167,7 @@ impl ServiceHandle {
                 | Effect::Repeat(_)
                 | Effect::PlayTrack { .. }
                 | Effect::PlayContext { .. }
+                | Effect::PlayTracks { .. }
                 | Effect::Enqueue(_)
                 | Effect::Transfer(_)
                 | Effect::TransferLocal(_)
@@ -371,12 +372,7 @@ fn perform(api: &SpotifyWebApi, token: &str, effect: Effect) -> ServiceResponse 
             ServiceResponse::Command { effect, result: api.shuffle(token, value) }
         }
         Effect::Repeat(value) => {
-            let mode = match value {
-                1 => "context",
-                2 => "track",
-                _ => "off",
-            };
-            ServiceResponse::Command { effect, result: api.repeat(token, mode) }
+            ServiceResponse::Command { effect, result: api.repeat(token, repeat_mode(value)) }
         }
         Effect::PlayTrack { uri, device_id } => {
             let result = play_track_with_retry(api, token, &uri, device_id.as_deref());
@@ -386,6 +382,10 @@ fn perform(api: &SpotifyWebApi, token: &str, effect: Effect) -> ServiceResponse 
             let result = play_context_with_retry(api, token, &uri, position, device_id.as_deref());
             ServiceResponse::Command { effect, result }
         }
+        Effect::PlayTracks { uris, device_id } => ServiceResponse::Command {
+            effect,
+            result: play_tracks_with_retry(api, token, &uris, device_id.as_deref()),
+        },
         Effect::Enqueue(uri) => {
             ServiceResponse::Command { effect, result: api.enqueue(token, &uri) }
         }
@@ -868,6 +868,69 @@ fn play_track_with_retry(
     initial
 }
 
+// Fetch every page before replacing playback: a page failure must not silently truncate
+// the queue. Positions are the original library positions, including unavailable entries.
+fn liked_playback_uris(
+    position: usize,
+    mut fetch: impl FnMut(u32) -> Result<lspotify_spotify::SpotifyPage<SpotifyBrowseItem>>,
+) -> Result<Vec<String>> {
+    let mut offset = 0;
+    let mut uris = Vec::new();
+    let mut selected_available = false;
+    loop {
+        let page = fetch(offset)?;
+        for item in page.items {
+            if item.position == Some(position) && item.available && item.uri.is_some() {
+                selected_available = true;
+            }
+            if item.available
+                && item.position.is_some_and(|pos| pos >= position)
+                && let Some(uri) = item.uri
+            {
+                uris.push(uri);
+            }
+        }
+        let Some(next) = page.next_offset else { break };
+        if next <= offset {
+            return Err(AppError::new(
+                ErrorKind::Network,
+                "Liked Songs pagination did not advance",
+            ));
+        }
+        offset = next;
+    }
+    if !selected_available {
+        return Err(AppError::new(
+            ErrorKind::Unavailable,
+            "The selected liked song is no longer available; refresh Liked Songs",
+        ));
+    }
+    Ok(uris)
+}
+
+fn play_tracks_with_retry(
+    api: &SpotifyWebApi,
+    token: &str,
+    uris: &[String],
+    device_id: Option<&str>,
+) -> Result<()> {
+    let initial = api.play_tracks_on_device(token, uris, device_id);
+    if let Err(ref error) = initial
+        && error.kind == ErrorKind::Unavailable
+    {
+        let target_device =
+            device_id.map(str::to_owned).or_else(|| resolve_fallback_device(api, token));
+        if let Some(ref target) = target_device {
+            let _ = api.transfer(token, target);
+            thread::sleep(Duration::from_millis(250));
+            if api.play_tracks_on_device(token, uris, Some(target)).is_ok() {
+                return Ok(());
+            }
+        }
+    }
+    initial
+}
+
 fn play_context_with_retry(
     api: &SpotifyWebApi,
     token: &str,
@@ -875,6 +938,12 @@ fn play_context_with_retry(
     position: usize,
     device_id: Option<&str>,
 ) -> Result<()> {
+    if uri == "spotify:collection:tracks" {
+        let uris = liked_playback_uris(position, |offset| {
+            api.liked_tracks_page(token, offset, PAGE_SIZE)
+        })?;
+        return play_tracks_with_retry(api, token, &uris, device_id);
+    }
     let initial = api.play_context_at(token, uri, position, device_id);
     if let Err(ref error) = initial
         && error.kind == ErrorKind::Unavailable
@@ -961,6 +1030,76 @@ fn resolve_fallback_device(api: &SpotifyWebApi, token: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn liked_page(
+        offset: u32,
+        next_offset: Option<u32>,
+    ) -> lspotify_spotify::SpotifyPage<SpotifyBrowseItem> {
+        lspotify_spotify::SpotifyPage {
+            items: (offset..offset + 50)
+                .filter(|pos| *pos != 76)
+                .map(|pos| SpotifyBrowseItem {
+                    id: pos.to_string(),
+                    kind: SpotifyEntityKind::Track,
+                    title: pos.to_string(),
+                    subtitle: String::new(),
+                    metadata: String::new(),
+                    // Duplicate songs must remain duplicated and keep their original positions.
+                    uri: Some(format!("spotify:track:{}", if pos == 78 { 75 } else { pos })),
+                    external_url: None,
+                    artwork_url: None,
+                    artists: Vec::new(),
+                    album: None,
+                    duration_ms: None,
+                    available: pos != 77,
+                    position: Some(pos as usize),
+                    saved: Some(true),
+                })
+                .collect(),
+            offset,
+            limit: 50,
+            total: 150,
+            next_offset,
+        }
+    }
+
+    #[test]
+    fn liked_playback_loads_all_pages_and_starts_at_original_position() {
+        let mut offsets = Vec::new();
+        let uris = liked_playback_uris(75, |offset| {
+            offsets.push(offset);
+            Ok(liked_page(offset, (offset < 100).then_some(offset + 50)))
+        })
+        .unwrap();
+        assert_eq!(offsets, vec![0, 50, 100]);
+        assert_eq!(uris.len(), 73);
+        assert_eq!(&uris[..3], &["spotify:track:75", "spotify:track:75", "spotify:track:79"]);
+        assert_eq!(uris.last().unwrap(), "spotify:track:149");
+    }
+
+    #[test]
+    fn liked_playback_does_not_play_a_partial_list_on_fetch_failure() {
+        let result = liked_playback_uris(0, |offset| {
+            if offset == 0 {
+                Ok(liked_page(0, Some(50)))
+            } else {
+                Err(AppError::new(ErrorKind::Network, "page failed"))
+            }
+        });
+        assert_eq!(result.unwrap_err().kind, ErrorKind::Network);
+    }
+
+    #[test]
+    fn liked_playback_rejects_missing_selection_and_stalled_pagination() {
+        assert_eq!(
+            liked_playback_uris(76, |offset| Ok(liked_page(offset, None))).unwrap_err().kind,
+            ErrorKind::Unavailable
+        );
+        assert_eq!(
+            liked_playback_uris(0, |offset| Ok(liked_page(offset, Some(offset)))).unwrap_err().kind,
+            ErrorKind::Network
+        );
+    }
 
     #[test]
     fn registration_retries_only_transient_errors_within_budget() {

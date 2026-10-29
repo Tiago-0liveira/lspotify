@@ -906,6 +906,24 @@ impl SpotifyWebApi {
         Self::send_command(request, token, &body)
     }
 
+    /// Starts an explicit ordered track list on the selected Connect device.
+    ///
+    /// # Errors
+    /// Returns an error for an empty list, invalid track URIs, or a rejected command.
+    pub fn play_tracks_on_device(
+        &self,
+        token: &str,
+        uris: &[String],
+        device_id: Option<&str>,
+    ) -> Result<()> {
+        let body = track_list_body(uris)?;
+        let mut request = self.client.put(format!("{API_BASE_URL}/me/player/play"));
+        if let Some(device_id) = device_id {
+            request = request.query(&[("device_id", device_id)]);
+        }
+        Self::send_command(request, token, &body)
+    }
+
     /// Starts a context at its original zero-based position. Positional offsets preserve duplicate
     /// tracks, unlike URI offsets which always identify the first matching track.
     ///
@@ -1826,6 +1844,28 @@ fn invalid_data(error: &reqwest::Error) -> AppError {
     AppError::new(ErrorKind::Network, format!("Spotify returned invalid data: {error}"))
 }
 
+fn track_list_body(uris: &[String]) -> Result<PlayBody<'_>> {
+    if uris.is_empty() {
+        return Err(AppError::new(ErrorKind::InvalidInput, "playback requires at least one track"));
+    }
+    for uri in uris {
+        let parsed = uri
+            .parse::<SpotifyUri>()
+            .map_err(|_| AppError::new(ErrorKind::InvalidInput, "invalid Spotify track URI"))?;
+        if parsed.kind() != SpotifyItemKind::Track {
+            return Err(AppError::new(
+                ErrorKind::InvalidInput,
+                "only tracks can be played in a track list",
+            ));
+        }
+    }
+    Ok(PlayBody {
+        uris: Some(uris.iter().map(String::as_str).collect()),
+        context_uri: None,
+        offset: None,
+    })
+}
+
 #[derive(Serialize)]
 struct PlayBody<'a> {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -2388,6 +2428,24 @@ mod tests {
         assert_eq!(page.offset, Some(50));
         assert_eq!(page.total, 120);
         assert!(page.next.is_some());
+    }
+
+    #[test]
+    fn explicit_track_playback_serializes_complete_order_including_duplicates() {
+        let uris = vec![
+            "spotify:track:first".into(),
+            "spotify:track:next".into(),
+            "spotify:track:next".into(),
+        ];
+        let body = serde_json::to_value(track_list_body(&uris).unwrap()).unwrap();
+        assert_eq!(body, serde_json::json!({"uris": uris}));
+    }
+
+    #[test]
+    fn explicit_track_playback_rejects_empty_invalid_and_non_track_lists() {
+        for uris in [vec![], vec!["invalid".into()], vec!["spotify:album:album".into()]] {
+            assert!(track_list_body(&uris).is_err());
+        }
     }
 
     #[test]
