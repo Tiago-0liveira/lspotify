@@ -201,20 +201,29 @@ fn handle_shortcut_capture_key(
     }
 }
 
+/// True while keystrokes feed a text field (search box, help filter, playlist rename).
+fn is_typing(state: &AppState) -> bool {
+    state.text_entry
+        || matches!(
+            state.overlay,
+            Some(Overlay::Help { editing: true, .. } | Overlay::RenamePlaylist { .. })
+        )
+}
+
 pub fn dispatch_key(state: &mut AppState, key: KeyEvent) -> Vec<Effect> {
     state.startup_focus_pending = false;
-    // Exit precedes shortcut capture, text entry, and overlays.
-    if state.shortcuts.is_quit(&key) {
+    // Exit precedes shortcut capture, text entry, and overlays. While typing, printable quit
+    // keys (`x`, `Shift+Q`) are text; only Ctrl-modified quit keys still exit.
+    let typing = is_typing(state);
+    let printable =
+        matches!(key.code, KeyCode::Char(_)) && !key.modifiers.contains(KeyModifiers::CONTROL);
+    if state.shortcuts.is_quit(&key) && !(typing && printable) {
         return reduce(state, Action::Quit);
     }
     if let Some(Overlay::ShortcutCapture { action, conflict }) = state.overlay.clone() {
         return handle_shortcut_capture_key(state, action, conflict, key);
     }
-    let action = if state.text_entry
-        || matches!(
-            state.overlay,
-            Some(Overlay::Help { editing: true, .. } | Overlay::RenamePlaylist { .. })
-        ) {
+    let action = if typing {
         if key.code == KeyCode::Backspace {
             Action::Backspace
         } else if state.shortcuts.matches_action(ShortcutAction::Cancel, &key) {
@@ -1796,9 +1805,17 @@ mod tests {
                     ..AppState::default()
                 };
                 dispatch_key(&mut state, key_event);
-                assert!(
+                let typing = *text_entry
+                    || matches!(
+                        overlay,
+                        Some(Overlay::Help { editing: true, .. } | Overlay::RenamePlaylist { .. })
+                    );
+                let printable = matches!(key_event.code, KeyCode::Char(_))
+                    && !key_event.modifiers.contains(KeyModifiers::CONTROL);
+                assert_eq!(
                     state.quit,
-                    "Key {key_event:?} must trigger quit with text_entry={text_entry}, overlay={overlay:?}"
+                    !(typing && printable),
+                    "Key {key_event:?} quit mismatch with text_entry={text_entry}, overlay={overlay:?}"
                 );
             }
         }
@@ -2916,6 +2933,7 @@ mod tests {
     fn global_quit_works_in_text_entry_and_overlays() {
         let mut state = AppState::default();
         let ctrl_c = KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL);
+        let x_key = KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE);
         let shift_q = KeyEvent::new(KeyCode::Char('q'), KeyModifiers::SHIFT);
         let lower_q = KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE);
 
@@ -2925,17 +2943,16 @@ mod tests {
         dispatch_key(&mut state, ctrl_c);
         assert!(state.quit);
 
+        // Printable quit keys are plain text while typing.
         state.quit = false;
         state.text_entry = true;
-        dispatch_key(&mut state, shift_q);
-        assert!(state.quit);
-
-        state.quit = false;
-        state.text_entry = true;
-        let effects = dispatch_key(&mut state, lower_q);
-        assert!(effects.is_empty());
-        assert_eq!(state.search_query, "q");
-        assert!(!state.quit);
+        state.search_query.clear();
+        for key in [x_key, shift_q, lower_q] {
+            let effects = dispatch_key(&mut state, key);
+            assert!(effects.is_empty());
+            assert!(!state.quit);
+        }
+        assert_eq!(state.search_query, "xqq");
 
         // In an overlay
         state.text_entry = false;
