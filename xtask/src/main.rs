@@ -31,7 +31,8 @@ fn run() -> io::Result<()> {
 
 fn dev() -> io::Result<()> {
     #[cfg(target_os = "windows")]
-    cargo(&["build", "-p", "lspotify-player-host", "-p", "lspotify-cli", "--bin", "lspotify"])?;
+    // No `--bin` filter: it would skip the player-host helper this build must also produce.
+    cargo(&["build", "-p", "lspotify-player-host", "-p", "lspotify-cli"])?;
     #[cfg(not(target_os = "windows"))]
     cargo(&["build", "-p", "lspotify-cli", "--bin", "lspotify"])?;
 
@@ -62,16 +63,7 @@ fn dev() -> io::Result<()> {
 
 fn build_dist() -> io::Result<()> {
     #[cfg(target_os = "windows")]
-    cargo(&[
-        "build",
-        "--release",
-        "-p",
-        "lspotify-cli",
-        "--bin",
-        "lspotify",
-        "-p",
-        "lspotify-player-host",
-    ])?;
+    cargo(&["build", "--release", "-p", "lspotify-cli", "-p", "lspotify-player-host"])?;
     #[cfg(not(target_os = "windows"))]
     cargo(&["build", "--release", "-p", "lspotify-cli", "--bin", "lspotify"])?;
     let release = PathBuf::from("target/release");
