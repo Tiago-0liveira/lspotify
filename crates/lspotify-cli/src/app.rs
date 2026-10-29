@@ -304,6 +304,7 @@ fn run() -> Result<()> {
                         | Effect::Previous
                         | Effect::PlayTrack { .. }
                         | Effect::PlayContext { .. }
+                        | Effect::PlayTracks { .. }
                 )
             });
             if is_track_change {
@@ -426,7 +427,8 @@ impl OptimisticTransport {
             Effect::Next
             | Effect::Previous
             | Effect::PlayTrack { .. }
-            | Effect::PlayContext { .. } => self.progress = None,
+            | Effect::PlayContext { .. }
+            | Effect::PlayTracks { .. } => self.progress = None,
             _ => {}
         }
     }
@@ -660,8 +662,12 @@ fn handle_response(
             Ok(()) => {
                 state.notice =
                     Some(Notice { kind: NoticeKind::Success, text: command_success(&effect) });
-                if matches!(effect, Effect::PlayTrack { .. } | Effect::PlayContext { .. })
-                    && state.overlay == Some(crate::Overlay::DevicePicker)
+                if matches!(
+                    effect,
+                    Effect::PlayTrack { .. }
+                        | Effect::PlayContext { .. }
+                        | Effect::PlayTracks { .. }
+                ) && state.overlay == Some(crate::Overlay::DevicePicker)
                 {
                     state.overlay = None;
                 }
@@ -678,6 +684,7 @@ fn handle_response(
                     Effect::Enqueue(_)
                         | Effect::PlayTrack { .. }
                         | Effect::PlayContext { .. }
+                        | Effect::PlayTracks { .. }
                         | Effect::Next
                         | Effect::Previous
                 ) {
@@ -1539,7 +1546,9 @@ fn command_success(effect: &Effect) -> String {
     match effect {
         Effect::Enqueue(_) => "Added to queue.".into(),
         Effect::Transfer(_) | Effect::TransferLocal(_) => "Playback device selected.".into(),
-        Effect::PlayTrack { .. } | Effect::PlayContext { .. } => "Playback started.".into(),
+        Effect::PlayTrack { .. } | Effect::PlayContext { .. } | Effect::PlayTracks { .. } => {
+            "Playback started.".into()
+        }
         Effect::SetSaved { saved: true, .. } => "♥ Added to Liked Songs".into(),
         Effect::SetSaved { saved: false, .. } => "♡ Removed from Liked Songs".into(),
         Effect::AddToPlaylist { .. } => "Added track to playlist.".into(),
