@@ -1057,6 +1057,50 @@ impl SpotifyWebApi {
         )
     }
 
+    /// Checks registration and transfers within the supplied total time budget.
+    ///
+    /// # Errors
+    /// Returns an error if Spotify rejects a request or the time budget expires.
+    pub fn transfer_if_registered(
+        &self,
+        token: &str,
+        device_id: &str,
+        budget: Duration,
+    ) -> Result<bool> {
+        let deadline = std::time::Instant::now() + budget;
+        let response = self
+            .client
+            .get(format!("{API_BASE_URL}/me/player/devices"))
+            .bearer_auth(token)
+            .timeout(budget)
+            .send()
+            .map_err(network_error)?;
+        if !response.status().is_success() {
+            return Err(registration_error(&response));
+        }
+        let devices: DevicesResponse = response.json().map_err(|error| invalid_data(&error))?;
+        if !devices
+            .devices
+            .iter()
+            .any(|device| device.id.as_deref() == Some(device_id) && !device.is_restricted)
+        {
+            return Ok(false);
+        }
+        let remaining = deadline
+            .checked_duration_since(std::time::Instant::now())
+            .filter(|remaining| !remaining.is_zero())
+            .ok_or_else(|| AppError::new(ErrorKind::Network, "Spotify request timed out"))?;
+        let response = self
+            .client
+            .put(format!("{API_BASE_URL}/me/player"))
+            .bearer_auth(token)
+            .timeout(remaining)
+            .json(&TransferBody { device_ids: [device_id], play: false })
+            .send()
+            .map_err(network_error)?;
+        if response.status().is_success() { Ok(true) } else { Err(registration_error(&response)) }
+    }
+
     /// Checks if tracks are in the current user's library.
     ///
     /// # Errors
@@ -1760,8 +1804,20 @@ fn response_error(response: &reqwest::blocking::Response) -> AppError {
     status_error(response.status())
 }
 
+fn registration_error(response: &reqwest::blocking::Response) -> AppError {
+    let mut error = response_error(response);
+    if response.status() == StatusCode::NOT_FOUND {
+        error.kind = ErrorKind::NotFound;
+    }
+    error
+}
+
 fn network_error(error: reqwest::Error) -> AppError {
-    let message = error.to_string();
+    let message = if error.is_timeout() {
+        "Spotify request timed out".to_string()
+    } else {
+        error.to_string()
+    };
     drop(error);
     AppError::new(ErrorKind::Network, message)
 }

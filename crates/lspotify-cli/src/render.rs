@@ -934,15 +934,22 @@ fn render_player_status(
     };
     let notice_width = group_x.saturating_sub(status_row.x).saturating_sub(1);
     let default_notice = if (5..8).contains(&notice_width) { "Ready" } else { "lspotify" };
-    let notice = state.notice.as_ref().map_or(default_notice, |notice| notice.text.as_str());
-    let notice_style = state.notice.as_ref().map_or(Style::default().fg(MUTED), |notice| {
-        Style::default().fg(match notice.kind {
-            crate::state::NoticeKind::Success => SAGE,
-            crate::state::NoticeKind::Pending => LAVENDER,
-            crate::state::NoticeKind::Error => PEACH,
-            crate::state::NoticeKind::Info => MUTED,
-        })
-    });
+    let notice = state
+        .backend_error
+        .as_ref()
+        .or(state.notice.as_ref())
+        .map_or(default_notice, |notice| notice.text.as_str());
+    let notice_style = state.backend_error.as_ref().or(state.notice.as_ref()).map_or(
+        Style::default().fg(MUTED),
+        |notice| {
+            Style::default().fg(match notice.kind {
+                crate::state::NoticeKind::Success => SAGE,
+                crate::state::NoticeKind::Pending => LAVENDER,
+                crate::state::NoticeKind::Error => PEACH,
+                crate::state::NoticeKind::Info => MUTED,
+            })
+        },
+    );
     frame.render_widget(
         Paragraph::new(truncate_cells(notice, notice_width)).style(notice_style),
         Rect { width: notice_width, ..status_row },

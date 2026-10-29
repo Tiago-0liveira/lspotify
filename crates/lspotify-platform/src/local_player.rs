@@ -57,7 +57,7 @@ impl ActiveBackend {
 
 /// Lazy local playback manager.
 ///
-/// Constructing this type does not initialize Spotify audio, WebView2, or librespot. The selected
+/// Constructing this type does not initialize Spotify audio, `WebView2`, or librespot. The selected
 /// backend is created only when a `Connect` command is sent.
 #[derive(Debug)]
 pub struct BackgroundLocalPlayer {
@@ -81,12 +81,16 @@ impl BackgroundLocalPlayer {
         }
     }
 
+    /// # Errors
+    /// Returns an error if a player lock is poisoned or the backend operation fails.
     pub fn backend(&self) -> Result<LocalPlaybackBackendPreference> {
         self.backend.lock().map_err(|_| poisoned()).map(|backend| *backend)
     }
 
     /// Changes the local backend. Any running local engine is stopped; the replacement remains
     /// lazy until local playback is requested again.
+    /// # Errors
+    /// Returns an error if a player lock is poisoned or the backend operation fails.
     pub fn set_backend(&self, backend: LocalPlaybackBackendPreference) -> Result<()> {
         let current = self.backend()?;
         if current == backend {
@@ -102,6 +106,8 @@ impl BackgroundLocalPlayer {
 
     /// Sends a typed local-player command. `TokenUpdate` is cached without starting an engine;
     /// `Connect` performs the lazy initialization.
+    /// # Errors
+    /// Returns an error if a player lock is poisoned or the backend operation fails.
     pub fn send(&self, command: LocalPlayerCommand) -> Result<()> {
         if let LocalPlayerCommand::TokenUpdate { access_token } = &command {
             *self.access_token.lock().map_err(|_| poisoned())? = Some(access_token.clone());
@@ -129,6 +135,8 @@ impl BackgroundLocalPlayer {
         active.send(command)
     }
 
+    /// # Errors
+    /// Returns an error if a player lock is poisoned or the backend operation fails.
     pub fn try_next_event(&self) -> Result<Option<LocalPlayerEvent>> {
         let maybe_event = {
             let active = self.active.lock().map_err(|_| poisoned())?;
@@ -154,23 +162,33 @@ impl BackgroundLocalPlayer {
         Ok(None)
     }
 
+    /// # Errors
+    /// Returns an error if a player lock is poisoned or the backend operation fails.
     pub fn is_ready(&self) -> Result<bool> {
         self.ready.lock().map_err(|_| poisoned()).map(|ready| *ready)
     }
 
+    /// # Errors
+    /// Returns an error if a player lock is poisoned or the backend operation fails.
     pub fn pid(&self) -> Result<Option<u32>> {
         let active = self.active.lock().map_err(|_| poisoned())?;
         Ok(active.as_ref().and_then(ActiveBackend::pid))
     }
 
+    /// # Errors
+    /// Returns an error if a player lock is poisoned or the backend operation fails.
     pub fn device_id(&self) -> Result<Option<String>> {
         self.device_id.lock().map_err(|_| poisoned()).map(|id| id.clone())
     }
 
+    /// # Errors
+    /// Returns an error if a player lock is poisoned or the backend operation fails.
     pub fn shutdown_reason(&self) -> Result<Option<String>> {
         self.shutdown_reason.lock().map_err(|_| poisoned()).map(|reason| reason.clone())
     }
 
+    /// # Errors
+    /// Returns an error if a player lock is poisoned or the backend operation fails.
     pub fn shutdown_with_reason(&self, reason: &str) -> Result<()> {
         {
             let mut shutdown_reason = self.shutdown_reason.lock().map_err(|_| poisoned())?;
@@ -184,6 +202,8 @@ impl BackgroundLocalPlayer {
         Ok(())
     }
 
+    /// # Errors
+    /// Returns an error if a player lock is poisoned or the backend operation fails.
     pub fn shutdown(&self) -> Result<()> {
         self.shutdown_with_reason("normal shutdown")
     }
@@ -248,7 +268,6 @@ struct WebPlaybackHost {
     events: Mutex<mpsc::Receiver<LocalPlayerEvent>>,
     child: Mutex<Option<Child>>,
     threads: Mutex<Vec<std::thread::JoinHandle<()>>>,
-    shutdown_reason: Arc<Mutex<Option<String>>>,
     pid: u32,
 }
 
@@ -260,7 +279,7 @@ impl WebPlaybackHost {
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .spawn()
-            .map_err(io_error)?;
+            .map_err(|error| io_error(&error))?;
         let pid = child.id();
         tracing::info!(pid, "spawned Web Playback SDK player-host");
 
@@ -296,14 +315,16 @@ impl WebPlaybackHost {
             events: Mutex::new(events),
             child: Mutex::new(Some(child)),
             threads: Mutex::new(threads),
-            shutdown_reason,
             pid,
         })
     }
 
     fn send(&self, command: LocalPlayerCommand) -> Result<()> {
-        self.commands.send(command).map_err(|_| {
-            AppError::new(ErrorKind::Unavailable, "local Web Playback SDK host has stopped")
+        self.commands.try_send(command).map_err(|_| {
+            AppError::new(
+                ErrorKind::Unavailable,
+                "local Web Playback SDK queue is full or the host has stopped",
+            )
         })
     }
 
@@ -317,12 +338,12 @@ impl WebPlaybackHost {
     }
 
     fn shutdown(&self) -> Result<()> {
-        let _ = self.commands.send(LocalPlayerCommand::Shutdown);
+        let _ = self.commands.try_send(LocalPlayerCommand::Shutdown);
         if let Some(mut child) = self.child.lock().map_err(|_| poisoned())?.take() {
             let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
             let mut exited = false;
             while std::time::Instant::now() < deadline {
-                if child.try_wait().map_err(io_error)?.is_some() {
+                if child.try_wait().map_err(|error| io_error(&error))?.is_some() {
                     exited = true;
                     break;
                 }
@@ -443,7 +464,7 @@ fn local_command_json(command: LocalPlayerCommand) -> String {
 }
 
 #[cfg(target_os = "windows")]
-fn io_error(error: std::io::Error) -> AppError {
+fn io_error(error: &std::io::Error) -> AppError {
     AppError::new(ErrorKind::Unavailable, error.to_string())
 }
 
@@ -458,9 +479,7 @@ mod tests {
     #[test]
     fn manager_is_lazy_until_connect() {
         let player = BackgroundLocalPlayer::start(LocalPlaybackBackendPreference::Librespot);
-        player
-            .send(LocalPlayerCommand::TokenUpdate { access_token: "token".into() })
-            .unwrap();
+        player.send(LocalPlayerCommand::TokenUpdate { access_token: "token".into() }).unwrap();
         assert_eq!(player.pid().unwrap(), None);
         assert!(!player.is_ready().unwrap());
     }
@@ -469,9 +488,7 @@ mod tests {
     #[test]
     fn web_backend_is_rejected_off_windows() {
         let player = BackgroundLocalPlayer::start(LocalPlaybackBackendPreference::SpotifyWeb);
-        player
-            .send(LocalPlayerCommand::TokenUpdate { access_token: "token".into() })
-            .unwrap();
+        player.send(LocalPlayerCommand::TokenUpdate { access_token: "token".into() }).unwrap();
         assert!(player.send(LocalPlayerCommand::Connect).is_err());
     }
 }

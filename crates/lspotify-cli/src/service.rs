@@ -5,7 +5,7 @@ use std::{
         mpsc::{self, Receiver, SyncSender, TryRecvError},
     },
     thread,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use lspotify_core::{AppError, ErrorKind, Result, SpotifyItemKind, SpotifyUri};
@@ -26,7 +26,7 @@ const PAGE_SIZE: u32 = 50;
 #[derive(Debug)]
 pub enum ServiceResponse {
     Page(PageState),
-    Playback(SpotifyPlayback),
+    Playback { playback: SpotifyPlayback, generation: u64 },
     Queue { now: Option<BrowseItem>, upcoming: Vec<BrowseItem> },
     PlaylistPicker { playlists: Vec<BrowseItem>, pending_uri: String },
     Command { effect: Effect, result: Result<()> },
@@ -34,7 +34,7 @@ pub enum ServiceResponse {
 
 #[derive(Debug)]
 enum Request {
-    Effect(Effect),
+    Effect(Effect, u64),
     Token(String),
     Shutdown,
 }
@@ -47,6 +47,36 @@ pub struct ServiceHandle {
     worker: Option<thread::JoinHandle<()>>,
     latest_browse_generation: Arc<AtomicU64>,
     shutdown: Arc<AtomicBool>,
+    playback_generation: AtomicU64,
+    pending_polls: Arc<PendingPolls>,
+}
+
+#[derive(Debug, Default)]
+struct PendingPolls {
+    playback: AtomicBool,
+    queue: AtomicBool,
+}
+
+impl PendingPolls {
+    fn flag(&self, effect: &Effect) -> Option<&AtomicBool> {
+        match effect {
+            Effect::RefreshPlayback => Some(&self.playback),
+            Effect::RefreshQueue => Some(&self.queue),
+            _ => None,
+        }
+    }
+
+    fn clear(&self, response: &ServiceResponse) {
+        let flag = match response {
+            ServiceResponse::Playback { .. } => Some(&self.playback),
+            ServiceResponse::Queue { .. } => Some(&self.queue),
+            ServiceResponse::Command { effect, .. } => self.flag(effect),
+            _ => None,
+        };
+        if let Some(flag) = flag {
+            flag.store(false, Ordering::Release);
+        }
+    }
 }
 
 impl ServiceHandle {
@@ -81,6 +111,8 @@ impl ServiceHandle {
         let worker_generation = Arc::clone(&latest_browse_generation);
         let shutdown = Arc::new(AtomicBool::new(false));
         let worker_shutdown = Arc::clone(&shutdown);
+        let pending_polls = Arc::new(PendingPolls::default());
+        let worker_polls = Arc::clone(&pending_polls);
         let worker = thread::Builder::new()
             .name("lspotify-spotify".into())
             .spawn(move || {
@@ -92,6 +124,7 @@ impl ServiceHandle {
                     &response_tx,
                     &worker_generation,
                     &worker_shutdown,
+                    &worker_polls,
                 );
             })
             .map_err(|error| {
@@ -107,6 +140,8 @@ impl ServiceHandle {
             worker: Some(worker),
             latest_browse_generation,
             shutdown,
+            playback_generation: AtomicU64::new(0),
+            pending_polls,
         })
     }
 
@@ -142,13 +177,24 @@ impl ServiceHandle {
                 | Effect::RemoveFromPlaylist { .. }
                 | Effect::RenamePlaylist { .. }
         );
-        if priority {
-            self.priority.send(Request::Effect(effect)).map_err(channel_error)
-        } else {
-            self.browse.try_send(Request::Effect(effect)).map_err(|error| {
-                AppError::new(ErrorKind::Unavailable, format!("background queue is busy: {error}"))
-            })
+        let pending = self.pending_polls.flag(&effect);
+        if pending.is_some_and(|flag| flag.swap(true, Ordering::AcqRel)) {
+            return Ok(());
         }
+        let sender = if priority { &self.priority } else { &self.browse };
+        let result = sender.try_send(Request::Effect(effect, self.playback_generation()));
+        let dropped_poll = pending.is_some() && matches!(result, Err(mpsc::TrySendError::Full(_)));
+        if result.is_err()
+            && let Some(flag) = pending
+        {
+            flag.store(false, Ordering::Release);
+        }
+        if dropped_poll {
+            return Ok(());
+        }
+        result.map_err(|error| {
+            AppError::new(ErrorKind::Unavailable, format!("background queue is busy: {error}"))
+        })
     }
 
     /// Replaces the access token used by subsequent requests.
@@ -159,11 +205,21 @@ impl ServiceHandle {
         if self.shutdown.load(Ordering::Acquire) {
             return Err(AppError::new(ErrorKind::Unavailable, "worker is shutting down"));
         }
-        self.priority.send(Request::Token(token)).map_err(channel_error)
+        self.priority.try_send(Request::Token(token)).map_err(channel_error)
+    }
+
+    pub fn mark_local_mutation(&self) {
+        self.playback_generation.fetch_add(1, Ordering::AcqRel);
+    }
+
+    pub fn playback_generation(&self) -> u64 {
+        self.playback_generation.load(Ordering::Acquire)
     }
 
     pub fn try_recv(&self) -> Option<ServiceResponse> {
-        self.responses.try_recv().ok()
+        let response = self.responses.try_recv().ok()?;
+        self.pending_polls.clear(&response);
+        Some(response)
     }
 
     pub fn latest_browse_generation(&self) -> u64 {
@@ -200,7 +256,7 @@ impl Drop for ServiceHandle {
     }
 }
 
-#[allow(clippy::needless_pass_by_value)]
+#[allow(clippy::needless_pass_by_value, clippy::too_many_arguments)]
 fn worker_loop<F>(
     mut performer: F,
     mut token: String,
@@ -209,6 +265,7 @@ fn worker_loop<F>(
     responses: &SyncSender<ServiceResponse>,
     latest_browse_generation: &AtomicU64,
     shutdown: &AtomicBool,
+    pending_polls: &PendingPolls,
 ) where
     F: FnMut(&str, Effect) -> ServiceResponse,
 {
@@ -231,20 +288,26 @@ fn worker_loop<F>(
         match request {
             Request::Shutdown => break,
             Request::Token(value) => token = value,
-            Request::Effect(effect) => {
+            Request::Effect(effect, generation) => {
                 if is_obsolete_browse_effect(
                     &effect,
                     latest_browse_generation.load(Ordering::Acquire),
                 ) {
                     continue;
                 }
-                let response = performer(&token, effect);
+                let response = match performer(&token, effect) {
+                    ServiceResponse::Playback { playback, .. } => {
+                        ServiceResponse::Playback { playback, generation }
+                    }
+                    response => response,
+                };
                 if shutdown.load(Ordering::Acquire) {
                     break;
                 }
                 match responses.try_send(response) {
                     Ok(()) => {}
-                    Err(mpsc::TrySendError::Full(_)) => {
+                    Err(mpsc::TrySendError::Full(response)) => {
+                        pending_polls.clear(&response);
                         if shutdown.load(Ordering::Acquire) {
                             break;
                         }
@@ -263,6 +326,20 @@ pub(crate) fn is_obsolete_browse_effect(effect: &Effect, latest_generation: u64)
     }
 }
 
+fn poll_response(api: &SpotifyWebApi, token: &str, effect: Effect) -> ServiceResponse {
+    match effect {
+        Effect::RefreshPlayback => match api.playback(token) {
+            Ok(playback) => ServiceResponse::Playback { playback, generation: 0 },
+            Err(error) => ServiceResponse::Command { effect, result: Err(error) },
+        },
+        Effect::RefreshQueue => match api.typed_queue(token) {
+            Ok(queue) => queue_response(queue),
+            Err(error) => ServiceResponse::Command { effect, result: Err(error) },
+        },
+        _ => unreachable!("only polling effects are routed here"),
+    }
+}
+
 fn perform(api: &SpotifyWebApi, token: &str, effect: Effect) -> ServiceResponse {
     match effect.clone() {
         Effect::LoadPage { route, generation, offset, query, tab } => {
@@ -271,14 +348,7 @@ fn perform(api: &SpotifyWebApi, token: &str, effect: Effect) -> ServiceResponse 
                 Err(error) => ServiceResponse::Command { effect, result: Err(error) },
             }
         }
-        Effect::RefreshPlayback => match api.playback(token) {
-            Ok(playback) => ServiceResponse::Playback(playback),
-            Err(error) => ServiceResponse::Command { effect, result: Err(error) },
-        },
-        Effect::RefreshQueue => match api.typed_queue(token) {
-            Ok(queue) => queue_response(queue),
-            Err(error) => ServiceResponse::Command { effect, result: Err(error) },
-        },
+        Effect::RefreshPlayback | Effect::RefreshQueue => poll_response(api, token, effect),
         Effect::TogglePlayback => {
             let result = api.playback(token).and_then(|snapshot| {
                 if snapshot.playing { api.pause(token) } else { api.resume(token) }
@@ -361,9 +431,7 @@ fn perform(api: &SpotifyWebApi, token: &str, effect: Effect) -> ServiceResponse 
         Effect::StartLocalPlayback
         | Effect::ChangeLocalPlaybackBackend(_)
         | Effect::OpenExternal(_)
-        | Effect::SaveSettings => {
-            ServiceResponse::Command { effect, result: Ok(()) }
-        }
+        | Effect::SaveSettings => ServiceResponse::Command { effect, result: Ok(()) },
         Effect::WarmLikedSongs => {
             match load_page(api, token, Route::Library, 0, 0, "", Some(LibraryTab::LikedSongs)) {
                 Ok(page) => ServiceResponse::Page(page),
@@ -832,40 +900,52 @@ fn play_context_with_retry(
     initial
 }
 
-fn transfer_local_when_registered(
-    api: &SpotifyWebApi,
-    token: &str,
-    device_id: &str,
-) -> Result<()> {
-    const ATTEMPTS: usize = 24;
-    const DELAY: Duration = Duration::from_millis(250);
+fn transfer_local_when_registered(api: &SpotifyWebApi, token: &str, device_id: &str) -> Result<()> {
+    retry_registration(Duration::from_secs(6), |remaining| {
+        api.transfer_if_registered(token, device_id, remaining)
+    })
+}
 
-    let mut last_error = None;
-    for attempt in 0..ATTEMPTS {
-        match api.devices(token) {
-            Ok(devices) => {
-                if devices.iter().any(|device| device.id == device_id && !device.restricted) {
-                    match api.transfer(token, device_id) {
-                        Ok(()) => return Ok(()),
-                        Err(error) => last_error = Some(error),
-                    }
-                }
-            }
-            Err(error) if error.kind != ErrorKind::Unavailable => return Err(error),
-            Err(error) => last_error = Some(error),
+fn registration_retry_delay(error: &AppError) -> Option<Duration> {
+    match error.kind {
+        ErrorKind::Unavailable => Some(Duration::from_millis(250)),
+        ErrorKind::Network if error.message == "Spotify request timed out" => {
+            Some(Duration::from_millis(250))
         }
-
-        if attempt + 1 < ATTEMPTS {
-            thread::sleep(DELAY);
-        }
+        ErrorKind::RateLimited => error.retry_after,
+        _ => None,
     }
+}
 
-    Err(last_error.unwrap_or_else(|| {
-        AppError::new(
-            ErrorKind::Unavailable,
-            "local Librespot device did not register with Spotify Connect within 6 seconds",
-        )
-    }))
+fn retry_registration(
+    budget: Duration,
+    mut attempt: impl FnMut(Duration) -> Result<bool>,
+) -> Result<()> {
+    let deadline = Instant::now() + budget;
+    let mut last_error = AppError::new(
+        ErrorKind::Unavailable,
+        "local device did not register with Spotify Connect within 6 seconds",
+    );
+    while let Some(remaining) =
+        deadline.checked_duration_since(Instant::now()).filter(|value| !value.is_zero())
+    {
+        let delay = match attempt(remaining) {
+            Ok(true) => return Ok(()),
+            Ok(false) => Duration::from_millis(250),
+            Err(error) => {
+                let Some(delay) = registration_retry_delay(&error) else {
+                    return Err(error);
+                };
+                last_error = error;
+                delay
+            }
+        };
+        if delay >= deadline.saturating_duration_since(Instant::now()) {
+            break;
+        }
+        thread::sleep(delay);
+    }
+    Err(last_error)
 }
 
 fn resolve_fallback_device(api: &SpotifyWebApi, token: &str) -> Option<String> {
@@ -881,6 +961,70 @@ fn resolve_fallback_device(api: &SpotifyWebApi, token: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn registration_retries_only_transient_errors_within_budget() {
+        for kind in [
+            ErrorKind::Authentication,
+            ErrorKind::Restricted,
+            ErrorKind::Authorization,
+            ErrorKind::NotFound,
+            ErrorKind::InvalidInput,
+            ErrorKind::Network,
+        ] {
+            let mut calls = 0;
+            assert!(
+                retry_registration(Duration::from_secs(6), |_| {
+                    calls += 1;
+                    Err(AppError::new(kind, "final error"))
+                })
+                .is_err()
+            );
+            assert_eq!(calls, 1);
+        }
+        assert!(
+            registration_retry_delay(&AppError::new(ErrorKind::Unavailable, "HTTP 503")).is_some()
+        );
+        assert!(
+            registration_retry_delay(&AppError::new(
+                ErrorKind::Network,
+                "Spotify request timed out"
+            ))
+            .is_some()
+        );
+        let mut calls = 0;
+        let start = Instant::now();
+        assert!(
+            retry_registration(Duration::from_millis(10), |remaining| {
+                assert!(remaining <= Duration::from_millis(10));
+                calls += 1;
+                Err(AppError::rate_limited("slow down", Duration::from_secs(60)))
+            })
+            .is_err()
+        );
+        assert_eq!(calls, 1);
+        assert!(start.elapsed() < Duration::from_secs(1));
+    }
+
+    #[test]
+    fn poll_generation_is_captured_when_request_is_enqueued() {
+        let handle = ServiceHandle::start_with_performer("token".into(), |_, _| {
+            ServiceResponse::Playback { playback: SpotifyPlayback::default(), generation: 99 }
+        })
+        .unwrap();
+        handle.send(Effect::RefreshPlayback).unwrap();
+        handle.mark_local_mutation();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            if let Some(ServiceResponse::Playback { generation, .. }) = handle.try_recv() {
+                assert_eq!(generation, 0);
+                assert_eq!(handle.playback_generation(), 1);
+                break;
+            }
+            assert!(Instant::now() < deadline);
+            thread::yield_now();
+        }
+    }
 
     #[test]
     fn repeat_mode_maps_values_and_out_of_bounds_to_off() {
@@ -1002,6 +1146,34 @@ mod tests {
         search_page.state = LoadState::Ready;
         assert!(state.accept_page(search_page));
         assert_eq!(state.page.route, Route::Search);
+    }
+
+    #[test]
+    fn redundant_polls_keep_only_one_request_of_each_kind_pending() {
+        let (started_tx, started_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let mut worker = ServiceHandle::start_with_performer("token".into(), move |_, effect| {
+            if effect == Effect::Next {
+                started_tx.send(()).unwrap();
+                release_rx.recv().unwrap();
+            }
+            ServiceResponse::Command { effect, result: Ok(()) }
+        })
+        .unwrap();
+        worker.send(Effect::Next).unwrap();
+        started_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        for _ in 0..100 {
+            worker.send(Effect::RefreshPlayback).unwrap();
+            worker.send(Effect::RefreshQueue).unwrap();
+        }
+        // Two coalesced polls leave exactly 62 slots for user requests.
+        for _ in 0..62 {
+            worker.send(Effect::Volume(50)).unwrap();
+        }
+        assert!(worker.send(Effect::Next).is_err());
+        worker.request_shutdown();
+        release_tx.send(()).unwrap();
+        worker.join_worker();
     }
 
     #[test]

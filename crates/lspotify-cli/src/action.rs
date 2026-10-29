@@ -567,6 +567,7 @@ pub fn reduce(state: &mut AppState, action: Action) -> Vec<Effect> {
         }
         Action::SubmitText => submit_text(state),
         Action::Cancel => {
+            state.backend_error = None;
             if state.overlay.is_some() {
                 state.overlay = None;
                 state.clear_error_notice();
@@ -843,6 +844,48 @@ fn cycle_local(state: &mut AppState, right: bool) -> Vec<Effect> {
     }
 }
 
+fn activate_device(state: &mut AppState, item: BrowseItem) -> Vec<Effect> {
+    if item.id == LOCAL_DEVICE_PLACEHOLDER {
+        if let Some(id) = state.local_device_id.clone() {
+            state.local_start_requested = false;
+            state.selected_device_id = Some(id.clone());
+            state.device_selected_by_user = true;
+            state.playback.device_id = Some(id.clone());
+            state.playback.device_name = Some("This computer".into());
+            state.overlay = None;
+            return vec![Effect::TransferLocal(id)];
+        }
+        // Keep the currently reported Spotify device/playback state intact while the
+        // local backend starts. Claiming "This computer" before Ready races with the
+        // regular playback poller and makes the status/player UI flicker between devices.
+        state.local_start_requested = true;
+        state.overlay = None;
+        state.notice = Some(Notice {
+            kind: NoticeKind::Pending,
+            text: format!("Starting {}…", state.local_playback_backend.label()),
+        });
+        vec![Effect::StartLocalPlayback]
+    } else if item.restricted {
+        state.notice = Some(Notice {
+            kind: NoticeKind::Error,
+            text: "Spotify marks this device as restricted; commands cannot be transferred to it."
+                .into(),
+        });
+        Vec::new()
+    } else {
+        item.uri.map_or_else(Vec::new, |id| {
+            state.selected_device_id = Some(id.clone());
+            state.device_selected_by_user = true;
+            let clean_title = item.title.replace(" (active)", "").replace(" (restricted)", "");
+            state.playback.device_name = Some(clean_title);
+            state.playback.device_id = Some(id.clone());
+            state.overlay = None;
+            state.clear_error_notice();
+            vec![Effect::Transfer(id)]
+        })
+    }
+}
+
 fn activate(state: &mut AppState) -> Vec<Effect> {
     if matches!(state.overlay, Some(Overlay::Menu)) {
         return AppState::NAVIGATION
@@ -892,35 +935,7 @@ fn activate(state: &mut AppState) -> Vec<Effect> {
         EntityKind::Artist => item.uri.map_or_else(Vec::new, |uri| {
             load_route(state, Route::Artist { uri, title: item.title })
         }),
-        EntityKind::Device => {
-            if item.id == LOCAL_DEVICE_PLACEHOLDER {
-                // Keep the currently reported Spotify device/playback state intact while the
-                // local backend starts. Claiming "This computer" before Ready races with the
-                // regular playback poller and makes the status/player UI flicker between devices.
-                state.local_start_requested = true;
-                state.overlay = None;
-                state.notice = Some(Notice {
-                    kind: NoticeKind::Pending,
-                    text: format!("Starting {}…", state.local_playback_backend.label()),
-                });
-                vec![Effect::StartLocalPlayback]
-            } else if item.restricted {
-                state.notice = Some(Notice { kind: NoticeKind::Error, text: "Spotify marks this device as restricted; commands cannot be transferred to it.".into() });
-                Vec::new()
-            } else {
-                item.uri.map_or_else(Vec::new, |id| {
-                    state.selected_device_id = Some(id.clone());
-                    state.device_selected_by_user = true;
-                    let clean_title =
-                        item.title.replace(" (active)", "").replace(" (restricted)", "");
-                    state.playback.device_name = Some(clean_title);
-                    state.playback.device_id = Some(id.clone());
-                    state.overlay = None;
-                    state.clear_error_notice();
-                    vec![Effect::Transfer(id)]
-                })
-            }
-        }
+        EntityKind::Device => activate_device(state, item),
         EntityKind::Action if !item.available => Vec::new(),
         EntityKind::Action if item.id.starts_with("recent-search:") => {
             let query = item.title.clone();
@@ -1518,7 +1533,8 @@ pub fn playback_settings_sections(state: &AppState) -> Vec<Section> {
             "Librespot registers at startup; choose This computer to transfer playback.".into()
         }
         LocalPlaybackBackendPreference::SpotifyWeb => {
-            "Web Playback starts when selected, or immediately after switching to this backend.".into()
+            "Web Playback starts when selected, or immediately after switching to this backend."
+                .into()
         }
     };
     vec![Section { title: "Local playback".into(), items: vec![backend] }]
@@ -1666,6 +1682,18 @@ fn submit_text(state: &mut AppState) -> Vec<Effect> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn selecting_ready_local_device_transfers_once_without_waiting_for_ready() {
+        let mut state =
+            AppState { local_device_id: Some("local-id".into()), ..AppState::default() };
+        let mut device = BrowseItem::message(LOCAL_DEVICE_PLACEHOLDER, "This computer");
+        device.kind = EntityKind::Device;
+        state.page.sections = vec![Section { title: "Devices".into(), items: vec![device] }];
+        assert_eq!(activate(&mut state), vec![Effect::TransferLocal("local-id".into())]);
+        assert!(!state.local_start_requested);
+        assert_eq!(state.selected_device_id.as_deref(), Some("local-id"));
+    }
+
     #[test]
     fn shuffle_and_repeat_mouse_targets_dispatch_only_inside_their_rectangles() {
         let now = Instant::now();
